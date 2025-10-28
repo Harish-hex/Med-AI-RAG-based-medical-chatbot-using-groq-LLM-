@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import faiss
 import numpy as np
 from dotenv import load_dotenv
@@ -35,6 +35,7 @@ app.add_middleware(
 
 # Global variables for models and data
 embedding_model = None
+reranker_model = None  # Cross-encoder for reranking
 faiss_index = None
 metadata = None
 llm_client = None
@@ -49,13 +50,18 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 def initialize_models():
     """Initialize all models and load data on startup"""
-    global embedding_model, faiss_index, metadata, llm_client, use_openai
+    global embedding_model, reranker_model, faiss_index, metadata, llm_client, use_openai
     
     try:
         # Load sentence transformer model
         logger.info(f"Loading embedding model: {EMBED_MODEL}")
         embedding_model = SentenceTransformer(EMBED_MODEL)
         logger.info("✅ Embedding model loaded successfully")
+        
+        # Load cross-encoder for reranking (improves context relevance)
+        logger.info("Loading cross-encoder for reranking...")
+        reranker_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        logger.info("✅ Cross-encoder loaded successfully")
         
         # Load FAISS index
         logger.info(f"Loading FAISS index from: {VECTOR_DB_FILE}")
@@ -130,37 +136,77 @@ def initialize_fallback_llm():
 
 def retrieve_context(query: str, top_k: int = 5) -> List[str]:
     """
-    Retrieve relevant context snippets from FAISS vector database.
+    Two-stage retrieval with cross-encoder reranking for better context relevance.
+    
+    Stage 1: FAISS retrieves top-N candidates (fast, broad search)
+    Stage 2: Cross-encoder reranks candidates (accurate, focused)
     
     Args:
         query: User's medical question
-        top_k: Number of top matches to retrieve
+        top_k: Number of top matches to return
         
     Returns:
-        List of relevant context strings
+        List of relevant context strings (reranked for quality)
     """
     try:
-        # Embed the query
+        # Stage 1: Retrieve more candidates than needed from FAISS
+        initial_k = min(top_k * 2, 15)  # Get 2x candidates for reranking
         query_embedding = embedding_model.encode([query], convert_to_numpy=True)
+        distances, indices = faiss_index.search(query_embedding, initial_k)
         
-        # Search FAISS index
-        distances, indices = faiss_index.search(query_embedding, top_k)
-        
-        # Extract context snippets
-        contexts = []
+        # Extract candidate contexts
+        candidates = []
         for idx in indices[0]:
             if idx < len(metadata):
                 text = metadata[idx]["text"]
-                # Truncate context to optimal length (max 600 chars for better coverage)
-                context = text[:600] + "..." if len(text) > 600 else text
-                contexts.append(context)
+                # Use longer chunks for reranking (will be truncated after selection)
+                candidates.append({
+                    "text": text,
+                    "idx": idx
+                })
         
-        logger.info(f"Retrieved {len(contexts)} context snippets for query")
+        if not candidates:
+            return []
+        
+        # Stage 2: Rerank with cross-encoder for better relevance
+        logger.info(f"Reranking {len(candidates)} candidates with cross-encoder...")
+        
+        # Create query-context pairs for reranking
+        pairs = [[query, cand["text"][:1000]] for cand in candidates]  # Use first 1000 chars for scoring
+        
+        # Get reranking scores
+        scores = reranker_model.predict(pairs)
+        
+        # Sort candidates by reranking score (higher is better)
+        ranked_indices = np.argsort(scores)[::-1][:top_k]
+        
+        # Extract final top-k contexts (now properly reranked)
+        contexts = []
+        for rank_idx in ranked_indices:
+            text = candidates[rank_idx]["text"]
+            # Moderate truncation for final context
+            context = text[:700] + "..." if len(text) > 700 else text
+            contexts.append(context)
+        
+        logger.info(f"Retrieved and reranked {len(contexts)} context snippets")
         return contexts
         
     except Exception as e:
         logger.error(f"Error in retrieve_context: {e}")
-        return []
+        # Fallback to simple retrieval if reranking fails
+        try:
+            query_embedding = embedding_model.encode([query], convert_to_numpy=True)
+            distances, indices = faiss_index.search(query_embedding, top_k)
+            contexts = []
+            for idx in indices[0]:
+                if idx < len(metadata):
+                    text = metadata[idx]["text"]
+                    context = text[:700] + "..." if len(text) > 700 else text
+                    contexts.append(context)
+            logger.warning("Used fallback retrieval (no reranking)")
+            return contexts
+        except:
+            return []
 
 def generate_answer_openai(query: str, contexts: List[str]) -> str:
     """Generate answer using Groq or OpenAI API"""
@@ -168,22 +214,23 @@ def generate_answer_openai(query: str, contexts: List[str]) -> str:
         # Construct the prompt
         joined_contexts = "\n\n".join([f"[{i+1}] {ctx}" for i, ctx in enumerate(contexts)])
         
-        prompt = f"""You are a reliable medical assistant AI.
-Use ONLY the following context to answer the user's question.
+        prompt = f"""You are a reliable medical assistant AI. Answer using ONLY the provided context.
 
 Instructions:
-- Answer directly and concisely
+- Answer the exact question asked directly and concisely
+- For Yes/No questions: Start with "Yes" or "No", then explain briefly
 - Use specific medical terminology when present in context
-- For Yes/No questions, start with Yes or No, then explain briefly
-- If information is insufficient, state: "I don't have enough reliable information to answer confidently."
-- Stay faithful to the provided context
+- Extract all relevant information from the context provided
+- If the context truly lacks the information needed, state: "I don't have enough reliable information to answer confidently."
+- NEVER add information not present in the context
+- Stay faithful to the provided context at all times
 
----
 Context:
 {joined_contexts}
 
-Question:
-{query}"""
+Question: {query}
+
+Answer based ONLY on the context above:"""
 
         # Determine which model to use (Groq or OpenAI)
         if GROQ_API_KEY and GROQ_API_KEY.strip():
@@ -202,9 +249,9 @@ Question:
                 {"role": "system", "content": "You are a helpful medical assistant that provides accurate, concise answers based only on provided context."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,  # Lower temperature for more focused, accurate answers
-            max_tokens=350,   # Slightly longer for complete answers
-            timeout=45        # Ensure we stay within 60-second limit
+            temperature=0.1,  # Low temp for high accuracy and faithfulness
+            max_tokens=350,   # Concise but complete answers
+            timeout=50        # Ensure we stay within 60-second limit
         )
         
         answer = response.choices[0].message.content.strip()
@@ -316,11 +363,10 @@ async def ask_question(request: Request):
                 detail="Invalid query. Please provide a non-empty string."
             )
         
-        # Validate top_k - use 5 as default for better context coverage
+        # Validate top_k - use recommended 3-5 range for best results
         if top_k < 1 or top_k > 10:
-            top_k = 5  # Default to 5 for better retrieval
-        elif top_k < 3:
-            top_k = 5  # Ensure minimum of 5 for better performance
+            top_k = 5  # Default to 5 (optimal per evaluation guidelines)
+        # Keep user's top_k if already in good range (3-7)
         
         logger.info(f"📝 Query received: {query[:100]}... (top_k={top_k})")
         
