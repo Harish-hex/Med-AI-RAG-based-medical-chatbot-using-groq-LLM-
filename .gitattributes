@@ -1,0 +1,2 @@
+outputs/medical_faiss.index filter=lfs diff=lfs merge=lfs -text
+outputs/medical_metadata.json filter=lfs diff=lfs merge=lfs -text

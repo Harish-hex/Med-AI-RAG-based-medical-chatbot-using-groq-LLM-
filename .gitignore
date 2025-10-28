@@ -1,0 +1,38 @@
+# Environment variables (NEVER commit API keys!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Temporary files
+run_*.py
+test_api.py
+PUBLIC_URL.txt
+RAILWAY_DEPLOY.sh
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Keep these important files for deployment
+!outputs/medical_faiss.index
+!outputs/medical_metadata.json
+!outputs/processing_summary.csv
+!outputs/cleaned_texts/
+
+# Large PDF files (too big for GitHub)
+medical_books/*.pdf
+
+# Cleaned text files (regeneratable)
+outputs/cleaned_texts/*.txt
